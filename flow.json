@@ -1,0 +1,2183 @@
+[
+    {
+        "id": "87b9abf9547a1194",
+        "type": "subflow",
+        "name": "Victron ESS Control Loop",
+        "info": "",
+        "category": "",
+        "in": [],
+        "out": [
+            {
+                "x": 900,
+                "y": 20,
+                "wires": [
+                    {
+                        "id": "6deae858bac21629",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 640,
+                "y": 140,
+                "wires": [
+                    {
+                        "id": "0f8644e76ed8cace",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 650,
+                "y": 220,
+                "wires": [
+                    {
+                        "id": "96b799323cbdf24e",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 1220,
+                "y": 300,
+                "wires": [
+                    {
+                        "id": "d5583e590381659d",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 950,
+                "y": 660,
+                "wires": [
+                    {
+                        "id": "4597670ef49c31f6",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 540,
+                "y": 400,
+                "wires": [
+                    {
+                        "id": "a52b169257a7c472",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 1120,
+                "y": 360,
+                "wires": [
+                    {
+                        "id": "bf6ebd792c8ba4ba",
+                        "port": 0
+                    }
+                ]
+            },
+            {
+                "x": 920,
+                "y": 100,
+                "wires": [
+                    {
+                        "id": "6deae858bac21629",
+                        "port": 2
+                    }
+                ]
+            }
+        ],
+        "env": [
+            {
+                "name": "VRM_TOKEN",
+                "type": "str",
+                "value": ""
+            },
+            {
+                "name": "SOLCAST_API_KEY",
+                "type": "str",
+                "value": ""
+            },
+            {
+                "name": "ESKOMSEPUSH_TOKEN",
+                "type": "str",
+                "value": ""
+            },
+            {
+                "name": "ESKOMSEPUSH_AREA_ID",
+                "type": "str",
+                "value": ""
+            },
+            {
+                "name": "BATTERY_CAPACITY_WATTS",
+                "type": "str",
+                "value": ""
+            },
+            {
+                "name": "VRM_INSTALLATION_ID",
+                "type": "num",
+                "value": ""
+            },
+            {
+                "name": "ENFORCE_NON_ZERO_SETPOINT",
+                "type": "bool",
+                "value": "true",
+                "ui": {
+                    "label": {
+                        "en-US": "Enforce a non-zero setpoint. Helpful in cases where small amounts of brief feedback into the grid can cause the meter to trip"
+                    },
+                    "type": "checkbox"
+                }
+            }
+        ],
+        "meta": {},
+        "color": "#DDAA99",
+        "outputLabels": [
+            "setpoint",
+            "solcast_forecast",
+            "loadshedding_data",
+            "vrm_average_consumption",
+            "latest_system_stats",
+            "",
+            "",
+            "switch_position"
+        ],
+        "status": {
+            "x": 860,
+            "y": 60,
+            "wires": [
+                {
+                    "id": "6deae858bac21629",
+                    "port": 1
+                }
+            ]
+        }
+    },
+    {
+        "id": "7e7ee993503d8596",
+        "type": "inject",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "1",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "10",
+        "topic": "",
+        "payload": "latest_stats",
+        "payloadType": "flow",
+        "x": 150,
+        "y": 40,
+        "wires": [
+            [
+                "4fcb12944bd35030"
+            ]
+        ]
+    },
+    {
+        "id": "4fcb12944bd35030",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "New control loop",
+        "func": "// Really simple. If the energy forecast says that we need to pump into\n// the battery, then we do it.\n//\n// First, determine the required charge rate.\nconst now = new Date();\nconst fool = 1;\nconst energy_forecast = flow.get('energy_forecast');\nconst index = energy_forecast.period_ends.findIndex((end) => now < end);\nconst required_soc_watts = energy_forecast.period_end_soc_watts[index];\nconst battery_watts = env.get('BATTERY_CAPACITY_WATTS');\nconst current_watts = msg.payload.battery_soc / 100.0 * battery_watts;\nconst shortfall_watts = required_soc_watts - current_watts;\nconst time_to_end_ms = energy_forecast.period_ends[index].getTime() - now.getTime();\nconst max_charge_rate = 5000; // XXX get from the VE bus\nconst required_charge_rate = Math.min(\n    // If we are within 200 watts of our required SoC, then don't bother\n    // charging the battery. This helps to avoid waffling where we charge\n    // and then don't charge repeatedly.\n    Math.max(0, shortfall_watts < 200 ? 0 : shortfall_watts) * 3600000 / time_to_end_ms,\n    max_charge_rate\n);\n\n// Now determine the current shortfall.\nconst demand_shortfall = msg.payload.ac_consumption - msg.payload.pv_power;\n\n// The grid setpoint is then just the sum of these two values.\nlet signed_setpoint = required_charge_rate + demand_shortfall;\nlet setpoint;\nlet switch_position = msg.payload.switch_position;\nconst charge_threshold = msg.payload.battery_soc < 25 ? 0 : 1000;\n\nif (shortfall_watts <= 0) {\n    // If we have enough charge in the battery, then we just draw from this\n    // rather than the grid.\n    setpoint = 0;\n    \n    // We also disconnect from the grid if we have enough surplus in the battery\n    // beyond what is required. This helps to limit unwanted grid feed-in, as well\n    // as limit a continuous small pull from the grid.\n    if (shortfall_watts < -1400 && msg.payload.switch_position == 3 && msg.payload.battery_soc >= 40) {\n        switch_position = 2;\n    }\n    else if ((shortfall_watts > -700 || msg.payload.battery_soc < 35) && msg.payload.switch_position == 2) {\n        // However, when our buffer decreases to a lower level we should re-engage\n        // our grid connection.\n        switch_position = 3;\n    }\n    \n}\nelse if (shortfall_watts >= charge_threshold) {\n    // If our battery is sufficiently undercharged relative to where we want\n    // it to be, then draw from the grid to charge it.\n    setpoint = Math.max(0, signed_setpoint);\n    switch_position = 3;\n}\nelse {\n    // Otherwise we just meet the demand shortfall.\n    setpoint = Math.max(0, demand_shortfall); // should always be > 0, but use\n                                              // max to guard against bugs making\n                                              // us feed back into the grid.\n    switch_position = 3;\n}\n\nif (env.get('ENFORCE_NON_ZERO_SETPOINT')) {\n    // Make sure we have a positive setpoint, which is continuously adjusted\n    // based on current load.\n    setpoint = Math.max(\n        setpoint,\n        // Start with a base of 100W, and for every 1kW beyond 500W of AC\n        // consumption we increase the setpoint by 200W. This helps to ensure\n        // that an energy-heavy device suddenly switching off (kettle, geyser,\n        // etc) doesn't cause the inverter to momentarily feed back into the\n        // grid. Larger loads are more likely to cause this, and therefore need\n        // a larger grid setpoint to compensate.\n        100 + Math.max(0, (msg.payload.ac_consumption - 500) / 5)\n        \n        // Slight tweak to the above just to get the prepaid meter installed.\n        //500 + Math.max(0, (msg.payload.ac_consumption - 500) / 6)\n    )\n}\n\nconst status = {\n    fill:\"green\",\n    shape:\"dot\",\n    text:now + \" Charge rate \" + required_charge_rate + \"; setpoint: \" + setpoint + \" switch_position: \" + switch_position + \" (forecast: \" + required_soc_watts + \"; current: \" + current_watts + \"; demand shortfall: \" + demand_shortfall + \")\"\n};\n\nreturn {\n    payload: {\n        setpoint,\n        status,\n        switch_position\n    }\n};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 390,
+        "y": 40,
+        "wires": [
+            [
+                "5a100de78366f41b"
+            ]
+        ]
+    },
+    {
+        "id": "5a100de78366f41b",
+        "type": "split",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "splt": "\\n",
+        "spltType": "str",
+        "arraySplt": 1,
+        "arraySpltType": "len",
+        "stream": false,
+        "addname": "topic",
+        "x": 590,
+        "y": 40,
+        "wires": [
+            [
+                "6deae858bac21629"
+            ]
+        ]
+    },
+    {
+        "id": "6deae858bac21629",
+        "type": "switch",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "property": "topic",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "eq",
+                "v": "setpoint",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "status",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "switch_position",
+                "vt": "str"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 3,
+        "x": 750,
+        "y": 40,
+        "wires": [
+            [],
+            [],
+            []
+        ]
+    },
+    {
+        "id": "0f8644e76ed8cace",
+        "type": "http request",
+        "z": "87b9abf9547a1194",
+        "name": "Get rooftop PV forecast ",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": "query",
+        "url": "https://api.solcast.com.au/rooftop_sites/d7a8-11ed-e983-62a6/forecasts",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 410,
+        "y": 120,
+        "wires": [
+            [
+                "dfaf24361002beb9"
+            ]
+        ]
+    },
+    {
+        "id": "c40ea53746d7a522",
+        "type": "inject",
+        "z": "87b9abf9547a1194",
+        "name": "Solcast parameters ",
+        "props": [
+            {
+                "p": "payload.format",
+                "v": "json",
+                "vt": "str"
+            },
+            {
+                "p": "payload.api_key",
+                "v": "SOLCAST_API_KEY",
+                "vt": "env"
+            },
+            {
+                "p": "headers.Authorization",
+                "v": "$join(\"Bearer \", $env('SOLCAST_API_KEY'))\t",
+                "vt": "jsonata"
+            }
+        ],
+        "repeat": "1800",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 0.1,
+        "topic": "",
+        "x": 140,
+        "y": 120,
+        "wires": [
+            [
+                "0f8644e76ed8cace"
+            ]
+        ]
+    },
+    {
+        "id": "dfaf24361002beb9",
+        "type": "change",
+        "z": "87b9abf9547a1194",
+        "name": "Store forecasts in context",
+        "rules": [
+            {
+                "t": "set",
+                "p": "pv_forecast",
+                "pt": "flow",
+                "to": "payload.forecasts",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 670,
+        "y": 100,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "772606bf99894d7f",
+        "type": "change",
+        "z": "87b9abf9547a1194",
+        "name": "Store loadshedding data in context",
+        "rules": [
+            {
+                "t": "set",
+                "p": "loadshedding",
+                "pt": "flow",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 700,
+        "y": 180,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "96b799323cbdf24e",
+        "type": "http request",
+        "z": "87b9abf9547a1194",
+        "name": "Get loadshedding data",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": "query",
+        "url": "https://developer.sepush.co.za/business/2.0/area",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 420,
+        "y": 200,
+        "wires": [
+            [
+                "772606bf99894d7f"
+            ]
+        ],
+        "info": "Old token: 6fKmPskz8AOya1yzvYQj"
+    },
+    {
+        "id": "ad10870e614bae03",
+        "type": "inject",
+        "z": "87b9abf9547a1194",
+        "name": "EskomSePush parameters",
+        "props": [
+            {
+                "p": "payload.id",
+                "v": "ESKOMSEPUSH_AREA_ID",
+                "vt": "env"
+            },
+            {
+                "p": "headers.Token",
+                "v": "ESKOMSEPUSH_TOKEN",
+                "vt": "env"
+            }
+        ],
+        "repeat": "1800",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 0.1,
+        "topic": "",
+        "x": 140,
+        "y": 200,
+        "wires": [
+            [
+                "96b799323cbdf24e"
+            ]
+        ]
+    },
+    {
+        "id": "9b5944682a026ff2",
+        "type": "inject",
+        "z": "87b9abf9547a1194",
+        "name": "Fetch historical load information from VRM",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            },
+            {
+                "p": "headers['x-authorization']",
+                "v": "VRM_TOKEN",
+                "vt": "env"
+            },
+            {
+                "p": "installation_id",
+                "v": "VRM_INSTALLATION_ID",
+                "vt": "env"
+            }
+        ],
+        "repeat": "600",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "0",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 190,
+        "y": 280,
+        "wires": [
+            [
+                "018bab623c07d987"
+            ]
+        ]
+    },
+    {
+        "id": "a15880e69cdbeaba",
+        "type": "http request",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": "query",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 690,
+        "y": 280,
+        "wires": [
+            [
+                "d5583e590381659d",
+                "bf6ebd792c8ba4ba"
+            ]
+        ]
+    },
+    {
+        "id": "d5583e590381659d",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "Compute average usage",
+        "func": "// We want to track three things:\n//\n// - our recent loads over the past week\n// - average load per day of the week over the past month\n// - how much our loads over the last 2 days have deviated from\n//.  our day-of-the-week averages (taking the mean of the last 2\n//.  days' values).\n//\n// The first is just for informational purposes to show in charts;\n// the second and third are what drive our core algorithm for estimating\n// future load and making sure that we have enough battery SoC to manage\n// these.\nconst allLoads = [];\nconst allLoadsByMinuteIndex = [];\nmsg.payload.records.total_consumption.forEach((record) => {\n    // Each record is of the form [timestamp_millis, kW]. The timestamp is\n    // for the start of the period, and should (!) be for the next 15\n    // minute window.\n    const start = new Date(record[0]);\n    const kw = record[1];\n    const day = start.getDay();\n    const minutesSinceStartOfDay = start.getHours() * 60 + start.getMinutes();\n    const minuteIndex = minutesSinceStartOfDay / 15;\n\n    // Check if we have the correct day & minute indices in our data.\n    while (allLoads.length <= day) {\n        allLoads.push([]);\n    }\n    while (allLoads[day].length <= minuteIndex) {\n        allLoads[day].push([]);\n    }\n    while (allLoadsByMinuteIndex.length <= minuteIndex) {\n        allLoadsByMinuteIndex.push([]);\n    }\n    \n    allLoads[day][minuteIndex].push(kw);\n    allLoadsByMinuteIndex[minuteIndex].push([day, kw]);\n});\n\n// Compute the derived data from our day-minute-index aligned data.\nconst recentLoads = [];\nconst averageLoads = [];\nconst loadDeviations = [];\nfor (let day = 0; day < 7; day++) {\n    recentLoads.push([]);\n    averageLoads.push([]);\n    for (let minuteIndex = 0; minuteIndex < allLoads[day].length; minuteIndex++) {\n        const count = allLoads[day][minuteIndex].length;\n        recentLoads[day][minuteIndex] = allLoads[day][minuteIndex][count - 1];\n        averageLoads[day][minuteIndex] = allLoads[day][minuteIndex].reduce((a,b) => a+b, 0) / count;\n    }\n}\n\nfor (let minuteIndex = 0; minuteIndex < allLoads[0].length; minuteIndex++) {\n    const minuteIndexLoads = allLoadsByMinuteIndex[minuteIndex];\n    const count = minuteIndexLoads.length;\n    const entry1 = minuteIndexLoads[count - 1];\n    const entry2 = minuteIndexLoads[count - 2];\n    loadDeviations.push(\n        (\n            entry1[1] - averageLoads[entry1[0]][minuteIndex] +\n            entry2[1] - averageLoads[entry2[0]][minuteIndex]\n        ) / 2\n    );\n}\n\n// Compute the load over the most recent ~2 hours.\nconst lastTwoHourStartIndex = msg.payload.records.total_consumption.length - 8;\nconst lastTwoHourLoad = {\n    startTimestamp: msg.payload.records.total_consumption[lastTwoHourStartIndex][0],\n    load: msg.payload.records.total_consumption.slice(lastTwoHourStartIndex).reduce((sum, val) => sum + val[1], 0)\n};\n\nreturn {\n    payload: {\n        recentLoads,\n        averageLoads,\n        loadDeviations,\n        allLoadsByMinuteIndex,\n        lastTwoHourLoad\n    }\n};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 930,
+        "y": 280,
+        "wires": [
+            [
+                "4cc8170ae322df65"
+            ]
+        ]
+    },
+    {
+        "id": "018bab623c07d987",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "Add timestamps",
+        "func": "return {\n    payload: {\n        start: Math.ceil((new Date().getTime() - 31 * 24 * 60 * 60 * 1000) / (15 * 60 * 1000)) * 15 * 60,\n        end: Math.floor(new Date().getTime() / (15 * 60 * 1000)) * 15 * 60\n    },\n    headers: {\n        'x-authorization': 'Token ' + msg.headers['x-authorization']\n    },\n    url: 'https://vrmapi.victronenergy.com/v2/installations/' + msg.installation_id + '/stats?type=custom&interval=15mins&attributeCodes%5B%5D=total_consumption'\n};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 480,
+        "y": 280,
+        "wires": [
+            [
+                "a15880e69cdbeaba"
+            ]
+        ]
+    },
+    {
+        "id": "4cc8170ae322df65",
+        "type": "change",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "average_consumption_vrm",
+                "pt": "flow",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 1240,
+        "y": 260,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "76e023e37bbb3f44",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "battery_soc",
+        "func": "return {\n    topic: node.name,\n    payload: msg.payload\n}",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 590,
+        "y": 560,
+        "wires": [
+            [
+                "4597670ef49c31f6"
+            ]
+        ]
+    },
+    {
+        "id": "6b12be770da834f5",
+        "type": "victron-input-system",
+        "z": "87b9abf9547a1194",
+        "service": "com.victronenergy.system",
+        "path": "/Dc/Pv/Power",
+        "serviceObj": {
+            "service": "com.victronenergy.system",
+            "name": "com.victronenergy.system",
+            "paths": [
+                {
+                    "path": "/Ac/ActiveIn/Source",
+                    "type": "enum",
+                    "name": "AC-Input",
+                    "enum": {
+                        "0": "Not available",
+                        "1": "Grid",
+                        "2": "Generator",
+                        "3": "Shore",
+                        "240": "Inverting"
+                    }
+                },
+                {
+                    "path": "/Ac/Consumption/L1/Power",
+                    "type": "float",
+                    "name": "AC Consumption L1 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L2/Power",
+                    "type": "float",
+                    "name": "AC Consumption L2 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L3/Power",
+                    "type": "float",
+                    "name": "AC Consumption L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/DeviceType",
+                    "type": "float",
+                    "name": "Genset Device Type",
+                    "enum": {}
+                },
+                {
+                    "path": "/Ac/Genset/L1/Power",
+                    "type": "float",
+                    "name": "Genset L1 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L2/Power",
+                    "type": "float",
+                    "name": "Genset L2 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L3/Power",
+                    "type": "float",
+                    "name": "Genset L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Genset Number Of Phases"
+                },
+                {
+                    "path": "/Ac/Grid/DeviceType",
+                    "type": "float",
+                    "name": "Grid Device Type"
+                },
+                {
+                    "path": "/Ac/Grid/L1/Power",
+                    "type": "float",
+                    "name": "Grid L1 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L2/Power",
+                    "type": "float",
+                    "name": "Grid L2 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L3/Power",
+                    "type": "float",
+                    "name": "Grid L3 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Grid Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L1/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L1"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L2/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L2"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L3/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L3"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV Power AC-tied on Generator Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on input Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on output Number Of Phases"
+                },
+                {
+                    "path": "/Buzzer/State",
+                    "type": "float",
+                    "name": "Buzzer State",
+                    "enum": {
+                        "0": "Off",
+                        "1": "On"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/ConsumedAmphours",
+                    "type": "float",
+                    "name": "Battery Consumed Amphours (Ah)"
+                },
+                {
+                    "path": "/Dc/Battery/Current",
+                    "type": "float",
+                    "name": "Battery current (A)"
+                },
+                {
+                    "path": "/Dc/Battery/Power",
+                    "type": "float",
+                    "name": "Battery Power (W)"
+                },
+                {
+                    "path": "/Dc/Battery/Soc",
+                    "type": "float",
+                    "name": "Battery State of Charge (%)"
+                },
+                {
+                    "path": "/Dc/Battery/State",
+                    "type": "enum",
+                    "name": "Battery state",
+                    "enum": {
+                        "0": "idle",
+                        "1": "charging",
+                        "2": "discharging"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/Temperature",
+                    "type": "float",
+                    "name": "Battery temperature (C)"
+                },
+                {
+                    "path": "/Dc/Battery/TimeToGo",
+                    "type": "float",
+                    "name": "Battery Time to Go (h)"
+                },
+                {
+                    "path": "/Dc/Battery/Voltage",
+                    "type": "float",
+                    "name": "Battery voltage (V)"
+                },
+                {
+                    "path": "/Dc/Charger/Power",
+                    "type": "integer",
+                    "name": "AC-Chargers - power (W)"
+                },
+                {
+                    "path": "/Dc/Pv/Current",
+                    "type": "float",
+                    "name": "MPPTs - current (A)"
+                },
+                {
+                    "path": "/Dc/Pv/Power",
+                    "type": "float",
+                    "name": "MPPTs - power (W)"
+                },
+                {
+                    "path": "/Dc/System/Power",
+                    "type": "float",
+                    "name": "DC System (W)"
+                },
+                {
+                    "path": "/Dc/Vebus/Current",
+                    "type": "float",
+                    "name": "VE.Bus charge current (A)"
+                },
+                {
+                    "path": "/Dc/Vebus/Power",
+                    "type": "float",
+                    "name": "VE.Bus charge power (W)"
+                },
+                {
+                    "path": "/Serial",
+                    "type": "string",
+                    "name": "Serial (System)"
+                },
+                {
+                    "path": "/SystemType",
+                    "type": "string",
+                    "name": "System type"
+                },
+                {
+                    "path": "/Timers/TimeOff",
+                    "type": "float",
+                    "name": "Time off (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGenerator",
+                    "type": "float",
+                    "name": "Time generator (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGrid",
+                    "type": "float",
+                    "name": "Time grid (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnInverter",
+                    "type": "float",
+                    "name": "Time inverting (s)"
+                }
+            ]
+        },
+        "pathObj": {
+            "path": "/Dc/Pv/Power",
+            "type": "float",
+            "name": "MPPTs - power (W)"
+        },
+        "initial": "",
+        "name": "",
+        "x": 260,
+        "y": 620,
+        "wires": [
+            [
+                "9b58b3ee98e55ded"
+            ]
+        ]
+    },
+    {
+        "id": "9b58b3ee98e55ded",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "pv_power",
+        "func": "return {\n    topic: node.name,\n    payload: msg.payload\n};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 600,
+        "y": 620,
+        "wires": [
+            [
+                "4597670ef49c31f6"
+            ]
+        ]
+    },
+    {
+        "id": "77f0b7352f47ac40",
+        "type": "victron-input-system",
+        "z": "87b9abf9547a1194",
+        "service": "com.victronenergy.system",
+        "path": "/Ac/Consumption/L1/Power",
+        "serviceObj": {
+            "service": "com.victronenergy.system",
+            "name": "com.victronenergy.system",
+            "paths": [
+                {
+                    "path": "/Ac/ActiveIn/Source",
+                    "type": "enum",
+                    "name": "AC-Input",
+                    "enum": {
+                        "0": "Not available",
+                        "1": "Grid",
+                        "2": "Generator",
+                        "3": "Shore",
+                        "240": "Inverting"
+                    }
+                },
+                {
+                    "path": "/Ac/Consumption/L1/Power",
+                    "type": "float",
+                    "name": "AC Consumption L1 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L2/Power",
+                    "type": "float",
+                    "name": "AC Consumption L2 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L3/Power",
+                    "type": "float",
+                    "name": "AC Consumption L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/DeviceType",
+                    "type": "float",
+                    "name": "Genset Device Type",
+                    "enum": {}
+                },
+                {
+                    "path": "/Ac/Genset/L1/Power",
+                    "type": "float",
+                    "name": "Genset L1 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L2/Power",
+                    "type": "float",
+                    "name": "Genset L2 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L3/Power",
+                    "type": "float",
+                    "name": "Genset L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Genset Number Of Phases"
+                },
+                {
+                    "path": "/Ac/Grid/DeviceType",
+                    "type": "float",
+                    "name": "Grid Device Type"
+                },
+                {
+                    "path": "/Ac/Grid/L1/Power",
+                    "type": "float",
+                    "name": "Grid L1 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L2/Power",
+                    "type": "float",
+                    "name": "Grid L2 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L3/Power",
+                    "type": "float",
+                    "name": "Grid L3 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Grid Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L1/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L1"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L2/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L2"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L3/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L3"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV Power AC-tied on Generator Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on input Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on output Number Of Phases"
+                },
+                {
+                    "path": "/Buzzer/State",
+                    "type": "float",
+                    "name": "Buzzer State",
+                    "enum": {
+                        "0": "Off",
+                        "1": "On"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/ConsumedAmphours",
+                    "type": "float",
+                    "name": "Battery Consumed Amphours (Ah)"
+                },
+                {
+                    "path": "/Dc/Battery/Current",
+                    "type": "float",
+                    "name": "Battery current (A)"
+                },
+                {
+                    "path": "/Dc/Battery/Power",
+                    "type": "float",
+                    "name": "Battery Power (W)"
+                },
+                {
+                    "path": "/Dc/Battery/Soc",
+                    "type": "float",
+                    "name": "Battery State of Charge (%)"
+                },
+                {
+                    "path": "/Dc/Battery/State",
+                    "type": "enum",
+                    "name": "Battery state",
+                    "enum": {
+                        "0": "idle",
+                        "1": "charging",
+                        "2": "discharging"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/Temperature",
+                    "type": "float",
+                    "name": "Battery temperature (C)"
+                },
+                {
+                    "path": "/Dc/Battery/TimeToGo",
+                    "type": "float",
+                    "name": "Battery Time to Go (h)"
+                },
+                {
+                    "path": "/Dc/Battery/Voltage",
+                    "type": "float",
+                    "name": "Battery voltage (V)"
+                },
+                {
+                    "path": "/Dc/Charger/Power",
+                    "type": "integer",
+                    "name": "AC-Chargers - power (W)"
+                },
+                {
+                    "path": "/Dc/Pv/Current",
+                    "type": "float",
+                    "name": "MPPTs - current (A)"
+                },
+                {
+                    "path": "/Dc/Pv/Power",
+                    "type": "float",
+                    "name": "MPPTs - power (W)"
+                },
+                {
+                    "path": "/Dc/System/Power",
+                    "type": "float",
+                    "name": "DC System (W)"
+                },
+                {
+                    "path": "/Dc/Vebus/Current",
+                    "type": "float",
+                    "name": "VE.Bus charge current (A)"
+                },
+                {
+                    "path": "/Dc/Vebus/Power",
+                    "type": "float",
+                    "name": "VE.Bus charge power (W)"
+                },
+                {
+                    "path": "/Serial",
+                    "type": "string",
+                    "name": "Serial (System)"
+                },
+                {
+                    "path": "/SystemType",
+                    "type": "string",
+                    "name": "System type"
+                },
+                {
+                    "path": "/Timers/TimeOff",
+                    "type": "float",
+                    "name": "Time off (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGenerator",
+                    "type": "float",
+                    "name": "Time generator (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGrid",
+                    "type": "float",
+                    "name": "Time grid (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnInverter",
+                    "type": "float",
+                    "name": "Time inverting (s)"
+                }
+            ]
+        },
+        "pathObj": {
+            "path": "/Ac/Consumption/L1/Power",
+            "type": "float",
+            "name": "AC Consumption L1 (W)"
+        },
+        "initial": "",
+        "name": "",
+        "x": 250,
+        "y": 680,
+        "wires": [
+            [
+                "0e0901e892dd5151"
+            ]
+        ]
+    },
+    {
+        "id": "0e0901e892dd5151",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "ac_consumption",
+        "func": "return {\n    topic: node.name,\n    payload: msg.payload\n}",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 580,
+        "y": 680,
+        "wires": [
+            [
+                "4597670ef49c31f6"
+            ]
+        ]
+    },
+    {
+        "id": "4597670ef49c31f6",
+        "type": "join",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "mode": "custom",
+        "build": "object",
+        "property": "payload",
+        "propertyType": "msg",
+        "key": "topic",
+        "joiner": "\\n",
+        "joinerType": "str",
+        "accumulate": true,
+        "timeout": "",
+        "count": "3",
+        "reduceRight": false,
+        "reduceExp": "",
+        "reduceInit": "",
+        "reduceInitType": "",
+        "reduceFixup": "",
+        "x": 770,
+        "y": 620,
+        "wires": [
+            [
+                "8add23252d820806"
+            ]
+        ]
+    },
+    {
+        "id": "8add23252d820806",
+        "type": "change",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "latest_stats",
+                "pt": "flow",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 950,
+        "y": 600,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "013fe430eee0bfe2",
+        "type": "victron-input-system",
+        "z": "87b9abf9547a1194",
+        "service": "com.victronenergy.system",
+        "path": "/Dc/Battery/Soc",
+        "serviceObj": {
+            "service": "com.victronenergy.system",
+            "name": "com.victronenergy.system",
+            "paths": [
+                {
+                    "path": "/Ac/ActiveIn/Source",
+                    "type": "enum",
+                    "name": "AC-Input",
+                    "enum": {
+                        "0": "Not available",
+                        "1": "Grid",
+                        "2": "Generator",
+                        "3": "Shore",
+                        "240": "Inverting"
+                    }
+                },
+                {
+                    "path": "/Ac/Consumption/L1/Power",
+                    "type": "float",
+                    "name": "AC Consumption L1 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L2/Power",
+                    "type": "float",
+                    "name": "AC Consumption L2 (W)"
+                },
+                {
+                    "path": "/Ac/Consumption/L3/Power",
+                    "type": "float",
+                    "name": "AC Consumption L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/DeviceType",
+                    "type": "float",
+                    "name": "Genset Device Type",
+                    "enum": {}
+                },
+                {
+                    "path": "/Ac/Genset/L1/Power",
+                    "type": "float",
+                    "name": "Genset L1 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L2/Power",
+                    "type": "float",
+                    "name": "Genset L2 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/L3/Power",
+                    "type": "float",
+                    "name": "Genset L3 (W)"
+                },
+                {
+                    "path": "/Ac/Genset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Genset Number Of Phases"
+                },
+                {
+                    "path": "/Ac/Grid/DeviceType",
+                    "type": "float",
+                    "name": "Grid Device Type"
+                },
+                {
+                    "path": "/Ac/Grid/L1/Power",
+                    "type": "float",
+                    "name": "Grid L1 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L2/Power",
+                    "type": "float",
+                    "name": "Grid L2 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/L3/Power",
+                    "type": "float",
+                    "name": "Grid L3 (W)"
+                },
+                {
+                    "path": "/Ac/Grid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "Grid Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L1/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L1"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L2/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L2"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/L3/Power",
+                    "type": "float",
+                    "name": "PV Power AC-tied on Generator L3"
+                },
+                {
+                    "path": "/Ac/PvOnGenset/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV Power AC-tied on Generator Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on input L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnGrid/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on input Number Of Phases"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L1/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L1 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L2/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L2 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/L3/Power",
+                    "type": "float",
+                    "name": "PV - AC-coupled on output L3 (W)"
+                },
+                {
+                    "path": "/Ac/PvOnOutput/NumberOfPhases",
+                    "type": "integer",
+                    "name": "PV - AC-coupled on output Number Of Phases"
+                },
+                {
+                    "path": "/Buzzer/State",
+                    "type": "float",
+                    "name": "Buzzer State",
+                    "enum": {
+                        "0": "Off",
+                        "1": "On"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/ConsumedAmphours",
+                    "type": "float",
+                    "name": "Battery Consumed Amphours (Ah)"
+                },
+                {
+                    "path": "/Dc/Battery/Current",
+                    "type": "float",
+                    "name": "Battery current (A)"
+                },
+                {
+                    "path": "/Dc/Battery/Power",
+                    "type": "float",
+                    "name": "Battery Power (W)"
+                },
+                {
+                    "path": "/Dc/Battery/Soc",
+                    "type": "float",
+                    "name": "Battery State of Charge (%)"
+                },
+                {
+                    "path": "/Dc/Battery/State",
+                    "type": "enum",
+                    "name": "Battery state",
+                    "enum": {
+                        "0": "idle",
+                        "1": "charging",
+                        "2": "discharging"
+                    }
+                },
+                {
+                    "path": "/Dc/Battery/Temperature",
+                    "type": "float",
+                    "name": "Battery temperature (C)"
+                },
+                {
+                    "path": "/Dc/Battery/TimeToGo",
+                    "type": "float",
+                    "name": "Battery Time to Go (h)"
+                },
+                {
+                    "path": "/Dc/Battery/Voltage",
+                    "type": "float",
+                    "name": "Battery voltage (V)"
+                },
+                {
+                    "path": "/Dc/Charger/Power",
+                    "type": "integer",
+                    "name": "AC-Chargers - power (W)"
+                },
+                {
+                    "path": "/Dc/Pv/Current",
+                    "type": "float",
+                    "name": "MPPTs - current (A)"
+                },
+                {
+                    "path": "/Dc/Pv/Power",
+                    "type": "float",
+                    "name": "MPPTs - power (W)"
+                },
+                {
+                    "path": "/Dc/System/Power",
+                    "type": "float",
+                    "name": "DC System (W)"
+                },
+                {
+                    "path": "/Dc/Vebus/Current",
+                    "type": "float",
+                    "name": "VE.Bus charge current (A)"
+                },
+                {
+                    "path": "/Dc/Vebus/Power",
+                    "type": "float",
+                    "name": "VE.Bus charge power (W)"
+                },
+                {
+                    "path": "/Serial",
+                    "type": "string",
+                    "name": "Serial (System)"
+                },
+                {
+                    "path": "/SystemType",
+                    "type": "string",
+                    "name": "System type"
+                },
+                {
+                    "path": "/Timers/TimeOff",
+                    "type": "float",
+                    "name": "Time off (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGenerator",
+                    "type": "float",
+                    "name": "Time generator (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnGrid",
+                    "type": "float",
+                    "name": "Time grid (s)"
+                },
+                {
+                    "path": "/Timers/TimeOnInverter",
+                    "type": "float",
+                    "name": "Time inverting (s)"
+                }
+            ]
+        },
+        "pathObj": {
+            "path": "/Dc/Battery/Soc",
+            "type": "float",
+            "name": "Battery State of Charge (%)"
+        },
+        "initial": "",
+        "name": "",
+        "x": 240,
+        "y": 560,
+        "wires": [
+            [
+                "76e023e37bbb3f44"
+            ]
+        ]
+    },
+    {
+        "id": "a52b169257a7c472",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "Compute load forecast",
+        "func": "// We need the following quantities aligned to 30 minute boundaries\n// for the next 24 hours:\n//\n// 1) solar forecast\n// 2) average consumption\n// 3) load shedding status\n// 4) probability of grid being unavailable (to be developed & will subsume 3)\n// 5) predicted excess energy (e.g. in the event of a cold snap)\n//\n// For the current period, we compute the value for the quantum\n// remaining in the time period.\n//\n// Start by obtaining our data. We align everything to the solar forecast\n// information, and so just iterate over that.\nlet solar_forecast_watts = [];\nlet average_consumption_watts = [];\nlet last_day_difference_from_average_watts = [];\nlet is_load_shedding = [];\nlet period_ends = [];\nlet now = new Date();\nlet start_date = new Date(Math.floor(now.getTime()  / (30 * 60 * 1000)) * 30 * 60 * 1000);\nlet end_date = new Date(start_date.getTime() + 24 * 60 * 60 * 1000);\nconst averageConsumption = flow.get('average_consumption_vrm');\n\n// Starting 20221221, Eskom implemented additional load reduction on\n// municipalities in arrears (such as Msunduzi). The below timetable\n// is how this affects our Hilton grid connection.\n//\n// Original timetable\n/*const load_reduction = [\n    [\n        // Sunday\n        [\"03:00\", \"05:30\"],\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n        [\"21:00\", \"23:30\"],\n    ],\n    [\n        // Monday\n        [\"05:00\", \"07:30\"],\n        [\"11:00\", \"13:30\"],\n        [\"17:00\", \"19:30\"],\n        [\"23:00\", \"24:00\"],\n    ],\n    [\n        // Tuesday\n        [\"00:00\", \"01:30\"],\n        [\"03:00\", \"05:30\"],\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n        [\"21:00\", \"23:30\"],\n    ],\n    [\n        // Wednesday\n        [\"01:00\", \"03:30\"],\n        [\"07:00\", \"09:30\"],\n        [\"13:00\", \"15:30\"],\n        [\"19:00\", \"21:30\"],\n    ],\n    [\n        // Thursday\n        [\"05:00\", \"07:30\"],\n        [\"11:00\", \"13:30\"],\n        [\"17:00\", \"19:30\"],\n        [\"23:00\", \"24:00\"],\n    ],\n    [\n        // Friday\n        [\"00:00\", \"01:30\"],\n        [\"03:00\", \"05:30\"],\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n        [\"21:00\", \"23:30\"],\n    ],\n    [\n        // Saturday\n        [\"01:00\", \"03:30\"],\n        [\"07:00\", \"09:30\"],\n        [\"13:00\", \"15:30\"],\n        [\"19:00\", \"21:30\"],\n    ],\n];*/\n// Timetable as of 20221223\n/*const load_reduction = [\n    [\n        // Sunday\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n    ],\n    [\n        // Monday\n        [\"11:00\", \"13:30\"],\n        [\"17:00\", \"19:30\"],\n    ],\n    [\n        // Tuesday\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n    ],\n    [\n        // Wednesday\n        [\"07:00\", \"09:30\"],\n        [\"13:00\", \"15:30\"],\n    ],\n    [\n        // Thursday\n        [\"11:00\", \"13:30\"],\n        [\"17:00\", \"19:30\"],\n    ],\n    [\n        // Friday\n        [\"09:00\", \"11:30\"],\n        [\"15:00\", \"17:30\"],\n    ],\n    [\n        // Saturday\n        [\"07:00\", \"09:30\"],\n        [\"13:00\", \"15:30\"],\n    ],\n];*/\n// Timetable as of ??? (load reduction removed)\nconst load_reduction = [\n    [\n        // Sunday\n    ],\n    [\n        // Monday\n    ],\n    [\n        // Tuesday\n    ],\n    [\n        // Wednesday\n    ],\n    [\n        // Thursday\n    ],\n    [\n        // Friday\n    ],\n    [\n        // Saturday\n    ],\n];\n\nflow.get('pv_forecast').forEach((period) => {\n    let end = new Date(period.period_end);\n    let start = new Date(end.getTime() - 30 * 60 * 1000); // XXX assumes a window of 30 minutes\n    if (start >= start_date && end <= end_date) {\n        period_ends.push(end);\n\n        let fraction;\n        if (now >= start && now < end) {\n            // Include a portion of the PV power forecast for this interval\n            fraction = (end.getTime() - now.getTime()) / (end.getTime() - start.getTime());\n        }\n        else {\n            // Include the full forecast for this interval which is in the\n            // future and today.\n            fraction = 1;\n        }\n\n        // XXX the 0.5 multiplier is because we expect the data to be for a\n        // 30 minute period (i.e. half an hour, and so the kWh produced will\n        // be half of what we would get in a full hour).\n        solar_forecast_watts.push(fraction * (period.pv_estimate10 + period.pv_estimate + period.pv_estimate90) / 3 * 1000 * 0.5);\n        \n        // Determine our average consumption for this period.\n        const startIndex = (start.getHours() * 60 + start.getMinutes()) / 15;\n        const endIndex   = (end  .getHours() * 60 + end  .getMinutes()) / 15;\n        const dayIndex = start.getDay();\n        //node.status({fill:\"green\",shape:\"dot\",text:start + \" \" + startIndex + \" \" + dayIndex});\n        /*let avg_consumption = (\n            averageConsumption.averageLoads[dayIndex][startIndex] +\n            averageConsumption.averageLoads[dayIndex][startIndex + 1] +\n            averageConsumption.loadDeviations[startIndex] +\n            averageConsumption.loadDeviations[startIndex + 1]\n        ) * 1000;*/\n        let avg_consumption = (\n            averageConsumption.recentLoads[0][startIndex] +\n            averageConsumption.recentLoads[1][startIndex] +\n            averageConsumption.recentLoads[2][startIndex] +\n            averageConsumption.recentLoads[3][startIndex] +\n            averageConsumption.recentLoads[4][startIndex] +\n            averageConsumption.recentLoads[5][startIndex] +\n            averageConsumption.recentLoads[6][startIndex] +\n            averageConsumption.recentLoads[0][startIndex + 1] +\n            averageConsumption.recentLoads[1][startIndex + 1] +\n            averageConsumption.recentLoads[2][startIndex + 1] +\n            averageConsumption.recentLoads[3][startIndex + 1] +\n            averageConsumption.recentLoads[4][startIndex + 1] +\n            averageConsumption.recentLoads[5][startIndex + 1] +\n            averageConsumption.recentLoads[6][startIndex + 1]\n        ) / 7 * 1000;\n        average_consumption_watts.push(avg_consumption);\n        \n        // Determine if we are currently in a load reduction period.\n        const isLoadReduction = load_reduction[dayIndex].some((interval) => {\n            const reductionStartIndex = (parseInt(interval[0].substring(0, 2)) * 60 + parseInt(interval[0].substring(3, 5))) / 15;\n            const reductionEndIndex   = (parseInt(interval[1].substring(0, 2)) * 60 + parseInt(interval[1].substring(3, 5))) / 15;\n            \n            const result = startIndex < reductionEndIndex && endIndex > reductionStartIndex;\n            if (result) {\n                node.status({fill:\"green\",shape:\"dot\",text:start + \" \" + dayIndex + \" \" + startIndex + \" \" + endIndex + \" \" + interval + \" \" + reductionStartIndex + \" \" + reductionEndIndex});\n            }\n            return result;\n        });\n            \n        // Determine if we are load shedding in this interval. We are\n        // loadshedding if some loadshedding slot overlaps at least part\n        // of our interval.\n        is_load_shedding.push(\n            flow.get('loadshedding').events.some((event) => {\n                return new Date(event.start) < end && new Date(event.end) > start;\n            }) || isLoadReduction\n        );\n    }\n});\n\n// Compute what our consumption was over the last 2 hours, and compare\n// this to the average consumption over that same time period to determine\n// how much additional energy we are using today relative to the average.\nconst additionalRecentLoad = (\n    averageConsumption.lastTwoHourLoad.load * 1000 -\n    average_consumption_watts.slice(44).reduce((sum, val) => sum + val, 0)\n);\nif (additionalRecentLoad > 0) {\n    // If we have seen more load recently, then forecast that we will also\n    // see the same additional load over the next 2 hours. This helps to\n    // accommodate for things like heaters/aircons and ensure that we plan\n    // properly.\n    //\n    // XXX we could possibly also apply the same thing if we see less load,\n    // but we aim to be a bit conservative & see how we go. Since we already\n    // allow for a constant pull from the grid this is probably OK and is more\n    // geared at getting us through periods of load-shedding without discharging\n    // the battery beyond our minimum SoC.\n    average_consumption_watts[0] += additionalRecentLoad / 4;\n    average_consumption_watts[1] += additionalRecentLoad / 4;\n    average_consumption_watts[2] += additionalRecentLoad / 4;\n    average_consumption_watts[3] += additionalRecentLoad / 4;\n}\n\n/*\nPlan ahead: the basic strategy is to start 23-24 hours in the future.\nOur minimum SoC in 23 hours time is simply whatever our typical reserve\nis + the expected loads for the 23-24 hour time window minus forecasted\nsolar production. For the time period from T to T+1 hours time, we compute\nthe same calculation except that we must end the period with the Soc\nrequired at the start of the next period. Proceed in this way to calculate\nthe minimum SoC at the start of each period in the next 24 hours.\n\nHowever, the above algorithm doesn't take into account the fact that we\ncan pull from the grid where necessary, nor does it account for excess\nsolar that could cause the computed values to drift into negative values\nof SoC. The latter is easy to deal with - we simply insist that we must\nend each period with at least the reserve SoC. To take into account the\nformer, we actually do nothing - the idea is that we should always have\nenough battery power to get us through the next 24 hours. If the solar\nforecast is terrible, then this means that we may front-load the battery\novernight - which is OK, as we will then use it the next day if we find\nourselves in a position where the battery is over-charged.\n*/\n\n// Now determine the minimum SoC required at the end of each interval.\nconst max_capacity = env.get('BATTERY_CAPACITY_WATTS');\nlet reserve_soc_watts = 21.0 / 100.0 * max_capacity; // XXX improve this\nlet max_grid_interval_watts = 500; // XXX allow for a partial continuous grid charge 220 * 40 / 2; // half-hour intervals\nlet period_end_soc_watts = Array.from({length: period_ends.length}, () => reserve_soc_watts);\nlet solar_efficiency = 1.00;\nfor (let i = period_ends.length - 1; i > 0; i--) {\n    // Compute the required battery SoC for the period ending i-1 as a\n    // function of our data for the period ending i.\n    let required_soc_watts = (\n        period_end_soc_watts[i] +\n        average_consumption_watts[i] -\n        solar_forecast_watts[i] * solar_efficiency\n    );\n\n    // If we are not load shedding in this interval, then we can use the\n    // grid and so lower our required SoC at the start of the interval.\n    // However, we only do this within \"sociable\" hours - meaning that if\n    // the grid fails, then we could run the generator. This guards against\n    // grid failure, and also adds a subtle pressure to have enough energy\n    // in the battery to last through the night.\n    if (!is_load_shedding[i] &&\n        period_ends[i].getHours() < 22 &&\n        period_ends[i].getHours() >= 6)\n    {\n        required_soc_watts -= max_grid_interval_watts;\n    }\n\n    // If it's the end of the day, then we want to finish off on 100%\n    // SOC.\n    if (period_ends[i].getHours() == 17) {\n        // This may actually be completely unnecessary. We should just use\n        // whatever is predicted as being required, rather than pulling\n        // unnecessarily from the grid.\n        //required_soc_watts = max_capacity;\n    }\n\n    // Insist on achieving at least the reserve SoC for the end of the\n    // interval.\n    period_end_soc_watts[i - 1] = Math.min(\n        Math.max(reserve_soc_watts, required_soc_watts),\n        max_capacity\n    );\n}\n\nreturn {\n    payload: {\n        solar_forecast_watts,\n        average_consumption_watts,\n        is_load_shedding,\n        period_end_soc_watts,\n        period_ends,\n        averageConsumption,\n        additionalRecentLoad\n    }\n};\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 360,
+        "y": 360,
+        "wires": [
+            [
+                "cacc7d0b2007a41f"
+            ]
+        ],
+        "info": "This node computes the forecasted load on the system, taking into account\nloadshedding schedules, historical loads and a prediction of when we expect the grid to be disconnected.\n\nPlan ahead: the basic strategy is to start 23-24 hours in the future. Our minimum SoC in 23 hours time is simply whatever our typical reserve is + the expected loads for the 23-24 hour time window minus forecasted solar production. For the time period from T to T+1 hours time, we compute the same calculation except that we must end the period with the Soc required at the start of the next period. Proceed in this way to calculate the minimum SoC at the start of each period in the next 24 hours.\n\nHowever, the above algorithm doesn't take into account the fact that we can pull from the grid where necessary, nor does it account for excess solar that could cause the computed values to drift into negative values of SoC. The latter is easy to deal with - we simply insist that we must end each period with at least the reserve SoC. To take into account the former, if we believe that the grid will be available, then we can reduce the required SoC for the start of the period by the amount of power that we expect to draw from the grid."
+    },
+    {
+        "id": "3ecce1da65f5932f",
+        "type": "inject",
+        "z": "87b9abf9547a1194",
+        "name": "Trigger load forecast",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "300",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "30",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 120,
+        "y": 360,
+        "wires": [
+            [
+                "a52b169257a7c472"
+            ]
+        ]
+    },
+    {
+        "id": "cacc7d0b2007a41f",
+        "type": "change",
+        "z": "87b9abf9547a1194",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "energy_forecast",
+                "pt": "flow",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 630,
+        "y": 340,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "bf6ebd792c8ba4ba",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "d": true,
+        "name": "Arrange for chart",
+        "func": "const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst labels = [...new Set(msg.payload.records.map((interval) => interval.time_interval))].sort() ;\n\nreturn {\n    payload: [{\n        series: days,\n        data: days.map((day) => {\n            const day_data = msg.payload.records.filter((interval) => {\n                return interval.day_of_week == day;\n            });\n            return labels.map((label) => {\n                const interval = day_data.find((interval) => interval.time_interval == label);\n                return interval ? interval.total_power / interval.num_samples : null;\n            })\n        }),\n        labels\n    }]\n}",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 910,
+        "y": 360,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "1b14abf0a8dbf0cd",
+        "type": "victron-input-vebus",
+        "z": "87b9abf9547a1194",
+        "service": "com.victronenergy.vebus.ttyS4",
+        "path": "/Mode",
+        "serviceObj": {
+            "service": "com.victronenergy.vebus.ttyS4",
+            "name": "MultiPlus-II 48/5000/70-50",
+            "paths": [
+                {
+                    "path": "/Ac/ActiveIn/ActiveInput",
+                    "type": "enum",
+                    "name": "Active input",
+                    "enum": {
+                        "0": "AC Input 1",
+                        "1": "AC Input 2",
+                        "240": "Disconnected"
+                    }
+                },
+                {
+                    "path": "/Ac/ActiveIn/L1/F",
+                    "type": "float",
+                    "name": "Input frequency 1 (Hz)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L1/I",
+                    "type": "float",
+                    "name": "Input current phase 1 (A)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L1/P",
+                    "type": "float",
+                    "name": "Input power 1 (W)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L1/V",
+                    "type": "float",
+                    "name": "Input voltage phase 1 (VAC)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L2/F",
+                    "type": "float",
+                    "name": "Input frequency 2 (Hz)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L2/I",
+                    "type": "float",
+                    "name": "Input current phase 2 (A)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L2/P",
+                    "type": "float",
+                    "name": "Input power 2 (W)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L2/V",
+                    "type": "float",
+                    "name": "Input voltage phase 2 (VAC)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L3/F",
+                    "type": "float",
+                    "name": "Input frequency 3 (Hz)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L3/I",
+                    "type": "float",
+                    "name": "Input current phase 3 (A)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L3/P",
+                    "type": "float",
+                    "name": "Input power 3 (W)"
+                },
+                {
+                    "path": "/Ac/ActiveIn/L3/V",
+                    "type": "float",
+                    "name": "Input voltage phase 3 (VAC)"
+                },
+                {
+                    "path": "/Ac/In/1/CurrentLimit",
+                    "type": "float",
+                    "name": "Input 1 current limit (A)"
+                },
+                {
+                    "path": "/Ac/In/1/CurrentLimitIsAdjustable",
+                    "type": "enum",
+                    "name": "Input 1 current limit is adjustable",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Ac/In/2/CurrentLimit",
+                    "type": "float",
+                    "name": "Input 2 current limit (A)"
+                },
+                {
+                    "path": "/Ac/In/2/CurrentLimitIsAdjustable",
+                    "type": "enum",
+                    "name": "Input 2 current limit is adjustable",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Ac/NumberOfPhases",
+                    "type": "float",
+                    "name": "Phase count"
+                },
+                {
+                    "path": "/Ac/Out/L1/F",
+                    "type": "float",
+                    "name": "Output frequency (Hz)"
+                },
+                {
+                    "path": "/Ac/Out/L1/I",
+                    "type": "float",
+                    "name": "Output current phase 1 (A)"
+                },
+                {
+                    "path": "/Ac/Out/L1/P",
+                    "type": "float",
+                    "name": "Output power 1 (W)"
+                },
+                {
+                    "path": "/Ac/Out/L1/V",
+                    "type": "float",
+                    "name": "Output voltage phase 1 (VAC)"
+                },
+                {
+                    "path": "/Ac/Out/L2/I",
+                    "type": "float",
+                    "name": "Output current phase 2 (A)"
+                },
+                {
+                    "path": "/Ac/Out/L2/P",
+                    "type": "float",
+                    "name": "Output power 2 (W)"
+                },
+                {
+                    "path": "/Ac/Out/L2/V",
+                    "type": "float",
+                    "name": "Output voltage phase 2 (VAC)"
+                },
+                {
+                    "path": "/Ac/Out/L3/I",
+                    "type": "float",
+                    "name": "Output current phase 3 (A)"
+                },
+                {
+                    "path": "/Ac/Out/L3/P",
+                    "type": "float",
+                    "name": "Output power 3 (W)"
+                },
+                {
+                    "path": "/Ac/Out/L3/V",
+                    "type": "float",
+                    "name": "Output voltage phase 3 (VAC)"
+                },
+                {
+                    "path": "/Ac/State/IgnoreAcIn1",
+                    "type": "enum",
+                    "name": "AC input 1 ignored",
+                    "enum": {
+                        "0": "AC input not ignored",
+                        "1": "AC input ignored"
+                    }
+                },
+                {
+                    "path": "/Alarms/GridLost",
+                    "type": "enum",
+                    "name": "Grid lost alarm",
+                    "enum": {
+                        "0": "Ok",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/HighTemperature",
+                    "type": "enum",
+                    "name": "Temperature",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L1/HighTemperature",
+                    "type": "enum",
+                    "name": "Temperature alarm L1",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L1/LowBattery",
+                    "type": "enum",
+                    "name": "Low battery alarm L1",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L1/Overload",
+                    "type": "enum",
+                    "name": "Overload alarm L1",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L1/Ripple",
+                    "type": "enum",
+                    "name": "Ripple alarm L1",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L2/HighTemperature",
+                    "type": "enum",
+                    "name": "Temperature alarm L2",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L2/LowBattery",
+                    "type": "enum",
+                    "name": "Low battery alarm L2",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L2/Overload",
+                    "type": "enum",
+                    "name": "Overload alarm L2",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L2/Ripple",
+                    "type": "enum",
+                    "name": "Ripple alarm L2",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L3/HighTemperature",
+                    "type": "enum",
+                    "name": "Temperature alarm L3",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L3/LowBattery",
+                    "type": "enum",
+                    "name": "Low battery alarm L3",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L3/Overload",
+                    "type": "enum",
+                    "name": "Overload alarm L3",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/L3/Ripple",
+                    "type": "enum",
+                    "name": "Ripple alarm L3",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/LowBattery",
+                    "type": "enum",
+                    "name": "Low battery",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/Overload",
+                    "type": "enum",
+                    "name": "Overload",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/PhaseRotation",
+                    "type": "enum",
+                    "name": "Phase Rotation",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning"
+                    }
+                },
+                {
+                    "path": "/Alarms/TemperatureSensor",
+                    "type": "enum",
+                    "name": "Temperatur sensor alarm",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Alarms/VoltageSensor",
+                    "type": "enum",
+                    "name": "Voltage sensor alarm",
+                    "enum": {
+                        "0": "Ok",
+                        "1": "Warning",
+                        "2": "Alarm"
+                    }
+                },
+                {
+                    "path": "/Bms/AllowToCharge",
+                    "type": "enum",
+                    "name": "BMS allows battery to be charged",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Bms/AllowToDischarge",
+                    "type": "enum",
+                    "name": "BMS allows battery to be discharged",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Bms/BmsExpected",
+                    "type": "enum",
+                    "name": "VE.Bus BMS is expected",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Bms/Error",
+                    "type": "enum",
+                    "name": "VE.Bus BMS error",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Dc/0/Current",
+                    "type": "float",
+                    "name": "Current (A)"
+                },
+                {
+                    "path": "/Dc/0/Temperature",
+                    "type": "float",
+                    "name": "Temperature (C)"
+                },
+                {
+                    "path": "/Dc/0/Voltage",
+                    "type": "float",
+                    "name": "Voltage (V)"
+                },
+                {
+                    "path": "/Energy/AcIn1ToAcOut",
+                    "type": "float",
+                    "name": "Energy ACIn1 to AcOut (kWh)"
+                },
+                {
+                    "path": "/Energy/AcIn1ToInverter",
+                    "type": "float",
+                    "name": "Energy AcIn1 to Inverter (kWh)"
+                },
+                {
+                    "path": "/Energy/AcIn2ToAcOut",
+                    "type": "float",
+                    "name": "Energy ACIn2 to AcOut (kWh)"
+                },
+                {
+                    "path": "/Energy/AcIn2ToInverter",
+                    "type": "float",
+                    "name": "Energy ACIn2 to Inverter (kWh)"
+                },
+                {
+                    "path": "/Energy/AcOutToAcIn1",
+                    "type": "float",
+                    "name": "Energy AcOut to AcIn1 (kWh)"
+                },
+                {
+                    "path": "/Energy/AcOutToAcIn2",
+                    "type": "float",
+                    "name": "Energy AcOut to AcIn2 (kWh)"
+                },
+                {
+                    "path": "/Energy/InverterToAcIn1",
+                    "type": "float",
+                    "name": "Energy Inverter to AcIn1 (kWh)"
+                },
+                {
+                    "path": "/Energy/InverterToAcIn2",
+                    "type": "float",
+                    "name": "Energy Inverter to AcIn2 (kWh)"
+                },
+                {
+                    "path": "/Energy/InverterToAcOut",
+                    "type": "float",
+                    "name": "Inverter To AcOut (kWh)"
+                },
+                {
+                    "path": "/Energy/OutToInverter",
+                    "type": "float",
+                    "name": "AcOut to Inverter (kWh)"
+                },
+                {
+                    "path": "/Hub4/Sustain",
+                    "type": "enum",
+                    "name": "Sustain active",
+                    "enum": {
+                        "0": "Sustain inactive",
+                        "1": "Sustain active"
+                    }
+                },
+                {
+                    "path": "/Mode",
+                    "type": "enum",
+                    "name": "Switch Position",
+                    "enum": {
+                        "1": "Charger Only",
+                        "2": "Inverter Only",
+                        "3": "On",
+                        "4": "Off"
+                    }
+                },
+                {
+                    "path": "/ModeIsAdjustable",
+                    "type": "enum",
+                    "name": "Mode is adjustable",
+                    "enum": {
+                        "0": "No",
+                        "1": "Yes"
+                    }
+                },
+                {
+                    "path": "/Soc",
+                    "type": "float",
+                    "name": "VE.Bus state of charge (%)"
+                },
+                {
+                    "path": "/State",
+                    "type": "enum",
+                    "name": "VE.Bus state",
+                    "enum": {
+                        "0": "Off",
+                        "1": "Low Power",
+                        "2": "Fault",
+                        "3": "Bulk",
+                        "4": "Absorption",
+                        "5": "Float",
+                        "6": "Storage",
+                        "7": "Equalize",
+                        "8": "Passthru",
+                        "9": "Inverting",
+                        "10": "Power assist",
+                        "11": "Power supply",
+                        "252": "Bulk protect"
+                    }
+                },
+                {
+                    "path": "/VebusError",
+                    "type": "enum",
+                    "name": "VE.Bus Error",
+                    "enum": {
+                        "0": "No error",
+                        "1": "VE.Bus Error 1: Device is switched off because one of the other phases in the system has switched off",
+                        "2": "VE.Bus Error 2: New and old types MK2 are mixed in the system",
+                        "3": "VE.Bus Error 3: Not all, or more than, the expected devices were found in the system",
+                        "4": "VE.Bus Error 4: No other device whatsoever detected",
+                        "5": "VE.Bus Error 5: Overvoltage on AC-out",
+                        "6": "VE.Bus Error 6: Error in DDC Program",
+                        "7": "VE.Bus Error 7:  BMS connected, which requires an Assistant, but no assistant found",
+                        "8": "VE.Bus Error 8: Ground relay test failed",
+                        "9": "VE.Bus Error 9",
+                        "10": "VE.Bus Error 10: System time synchronisation problem occurred",
+                        "11": "VE.Bus Error 11: Relay test fault",
+                        "12": "VE.Bus Error 12",
+                        "13": "VE.Bus Error 13",
+                        "14": "VE.Bus Error 14: Device cannot transmit data",
+                        "15": "VE.Bus Error 15",
+                        "16": "VE.Bus Error 16: Awaiting configuration or dongle missing",
+                        "17": "VE.Bus Error 17: Phase master missing",
+                        "18": "VE.Bus Error 18: AC Overvoltage on the output of a slave has occurred while already switched off",
+                        "19": "VE.Bus Error 19",
+                        "20": "VE.Bus Error 20",
+                        "21": "VE.Bus Error 21",
+                        "22": "VE.Bus Error 22: This device cannot function as slave",
+                        "23": "VE.Bus Error 23",
+                        "24": "VE.Bus Error 24: Switch-over system protection initiated",
+                        "25": "VE.Bus Error 25: Firmware incompatibility. The firmware of one of the connected device is not sufficiently up to date to operate in conjunction with this device",
+                        "26": "VE.Bus Error 26: Internal error",
+                        "27": "VE.Bus Error 27",
+                        "28": "VE.Bus Error 28",
+                        "29": "VE.Bus Error 29",
+                        "30": "VE.Bus Error 30",
+                        "31": "VE.Bus Error 31",
+                        "32": "VE.Bus Error 32"
+                    }
+                }
+            ]
+        },
+        "pathObj": {
+            "path": "/Mode",
+            "type": "enum",
+            "name": "Switch Position",
+            "enum": {
+                "1": "Charger Only",
+                "2": "Inverter Only",
+                "3": "On",
+                "4": "Off"
+            }
+        },
+        "initial": "",
+        "name": "",
+        "x": 280,
+        "y": 740,
+        "wires": [
+            [
+                "f016d019f53e941f"
+            ]
+        ]
+    },
+    {
+        "id": "f016d019f53e941f",
+        "type": "function",
+        "z": "87b9abf9547a1194",
+        "name": "switch_position",
+        "func": "return {\n    topic: node.name,\n    payload: msg.payload\n}",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 580,
+        "y": 740,
+        "wires": [
+            [
+                "4597670ef49c31f6"
+            ]
+        ]
+    }
+]
